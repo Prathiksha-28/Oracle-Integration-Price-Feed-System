@@ -1,0 +1,328 @@
+RUST BACKEND — FULL SERVICE CODEBASE
+# oracle-backend/Cargo.toml
+[package]
+name = "oracle-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.6"
+redis = "0.23"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.10"
+solana-client = "1.18"
+solana-sdk = "1.18"
+pyth-sdk-solana = "0.7.0"
+switchboard-solana = "0.3.3"
+futures = "0.3"
+tokio-stream = "0.1"
+
+# oracle-backend/src/main.rs
+mod config;
+mod manager;
+mod clients;
+mod aggregator;
+mod api;
+mod storage;
+mod models;
+
+use manager::oracle_manager::OracleManager;
+use api::rest::start_rest_api;
+
+#[tokio::main]
+async fn main() {
+    let config = config::Config::load();
+
+    let mut manager = OracleManager::new(config.clone()).await;
+
+    tokio::spawn(async move { manager.run().await });
+
+    start_rest_api(config).await;
+}
+
+Managers
+
+# oracle-backend/src/manager/oracle_manager.rs
+`
+use crate::{
+    clients::{pyth_client::PythClient, switchboard_client::SwitchboardClient},
+    aggregator::price_aggregator::PriceAggregator,
+    storage::{redis::RedisStore, postgres::PostgresStore},
+    models::price::NormalizedPrice,
+    config::Config,
+};
+
+pub struct OracleManager {
+    pyth: PythClient,
+    switchboard: SwitchboardClient,
+    aggregator: PriceAggregator,
+    redis: RedisStore,
+    db: PostgresStore,
+    config: Config,
+}
+
+impl OracleManager {
+    pub async fn new(config: Config) -> Self {
+        Self {
+            pyth: PythClient::new(&config.rpc_url),
+            switchboard: SwitchboardClient::new(&config.rpc_url),
+            aggregator: PriceAggregator::new(),
+            redis: RedisStore::new(&config.redis_url).await,
+            db: PostgresStore::new(&config.postgres_url).await,
+            config,
+        }
+    }
+
+    pub async fn run(&mut self) {
+        loop {
+            for sym in &self.config.symbols {
+                let pyth_price = self.pyth.get_price_data(&sym.pyth).await.ok();
+                let sb_price = self.switchboard.get_price_data(&sym.switchboard).await.ok();
+
+                let consensus = self.aggregator
+                    .aggregate(&sym.symbol, vec![pyth_price, sb_price])
+                    .await;
+
+                if let Some(price) = consensus {
+                    self.redis.store_price(&sym.symbol, &price).await;
+                    self.db.insert_price_history(&sym.symbol, &price).await;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
+}
+`
+-------------------------------------
+Clients (Pyth & Switchboard)
+-------------------------------------
+# oracle-backend/src/clients/pyth_client.rs
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use pyth_sdk_solana::load_price_feed_from_account_info;
+
+use crate::models::price::RawPrice;
+
+pub struct PythClient {
+    rpc: RpcClient,
+}
+
+impl PythClient {
+    pub fn new(url: &str) -> Self {
+        Self { rpc: RpcClient::new(url.to_string()) }
+    }
+
+    pub async fn get_price_data(&self, feed: &Pubkey) -> Result<RawPrice, ()> {
+        let acc = self.rpc.get_account(feed).map_err(|_| ())?;
+        let pf = load_price_feed_from_account_info(feed, &acc).map_err(|_| ())?;
+        let price = pf.get_current_price().ok_or(())?;
+
+        Ok(RawPrice {
+            price: price.price as f64 / 10f64.powi(price.expo),
+            confidence: price.conf as f64 / 10f64.powi(price.expo),
+            timestamp: price.timestamp,
+        })
+    }
+}
+
+# oracle-backend/src/clients/switchboard_client.rs
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use switchboard_solana::AggregatorAccountData;
+
+use crate::models::price::RawPrice;
+
+pub struct SwitchboardClient {
+    rpc: RpcClient,
+}
+
+impl SwitchboardClient {
+    pub fn new(url: &str) -> Self {
+        Self { rpc: RpcClient::new(url.to_string()) }
+    }
+
+    pub async fn get_price_data(&self, aggr: &Pubkey) -> Result<RawPrice, ()> {
+        let acc = self.rpc.get_account(aggr).map_err(|_| ())?;
+        let aggregator = AggregatorAccountData::deserialize(&mut acc.data.as_slice()).map_err(|_| ())?;
+        let round = aggregator.get_result()?.ok_or(())?;
+
+        Ok(RawPrice {
+            price: round.value,
+            confidence: round.confidence,
+            timestamp: round.timestamp,
+        })
+    }
+}
+
+-------------------------------------
+Aggregator
+------------------------------------
+# oracle-backend/src/aggregator/price_aggregator.rs
+use crate::models::price::{RawPrice, NormalizedPrice};
+
+pub struct PriceAggregator {}
+
+impl PriceAggregator {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub async fn aggregate(
+        &self,
+        symbol: &str,
+        inputs: Vec<Option<RawPrice>>,
+    ) -> Option<NormalizedPrice> {
+        let mut valid = inputs.into_iter().flatten().collect::<Vec<_>>();
+        if valid.is_empty() {
+            return None;
+        }
+
+        valid.sort_by(|a, b| a.price.total_cmp(&b.price));
+        let median = valid[valid.len() / 2].clone();
+
+        Some(NormalizedPrice {
+            symbol: symbol.to_string(),
+            price: median.price,
+            confidence: median.confidence,
+            timestamp: median.timestamp,
+        })
+    }
+}
+
+-------------------------------------
+API (REST + WebSocket)
+-------------------------------------
+# oracle-backend/src/api/rest.rs
+use axum::{
+    routing::get,
+    Router,
+    response::Json,
+};
+use crate::storage::redis::RedisStore;
+use crate::config::Config;
+
+pub async fn start_rest_api(config: Config) {
+    let redis = RedisStore::new(&config.redis_url).await;
+
+    let app = Router::new()
+        .route("/oracle/price/:symbol", get(move |p| get_price(p, redis.clone())));
+
+    axum::Server::bind(&"0.0.0.0:8080".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+async fn get_price(
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+    redis: RedisStore,
+) -> Json<serde_json::Value> {
+    let p = redis.get_price(&symbol).await;
+    Json(serde_json::json!({ "symbol": symbol, "data": p }))
+}
+
+-------------------------------------
+Model Objects
+-------------------------------------
+# oracle-backend/src/models/price.rs
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawPrice {
+    pub price: f64,
+    pub confidence: f64,
+    pub timestamp: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NormalizedPrice {
+    pub symbol: String,
+    pub price: f64,
+    pub confidence: f64,
+    pub timestamp: i64,
+}
+
+-------------------------------------
+Storage (Redis + Postgres)
+-------------------------------------
+# oracle-backend/src/storage/redis.rs
+use redis::AsyncCommands;
+use crate::models::price::NormalizedPrice;
+
+#[derive(Clone)]
+pub struct RedisStore {
+    client: redis::Client,
+}
+
+impl RedisStore {
+    pub async fn new(url: &str) -> Self {
+        Self { client: redis::Client::open(url).unwrap() }
+    }
+
+    pub async fn store_price(&self, symbol: &str, p: &NormalizedPrice) {
+        let mut conn = self.client.get_async_connection().await.unwrap();
+        let _: () = conn
+            .set(format!("oracle:price:{symbol}"), serde_json::to_string(p).unwrap())
+            .await
+            .unwrap();
+    }
+
+    pub async fn get_price(&self, symbol: &str) -> Option<NormalizedPrice> {
+        let mut conn = self.client.get_async_connection().await.ok()?;
+        let data: String = conn.get(format!("oracle:price:{symbol}")).await.ok()?;
+        serde_json::from_str(&data).ok()
+    }
+}
+
+-------------------------------------
+Postgres migrations
+-------------------------------------
+# oracle-backend/migrations/001_price_history.sql
+CREATE TABLE price_history (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    source TEXT,
+    timestamp BIGINT NOT NULL,
+    inserted_at TIMESTAMP DEFAULT now()
+);
+
+---------------------------------------------------------
+Docker Compose
+---------------------------------------------------------
+# docker-compose.yml
+version: "3.7"
+services:
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_PASSWORD: oracle
+      POSTGRES_USER: oracle
+      POSTGRES_DB: oracle
+    ports:
+      - "5432:5432"
+
+  oracle-backend:
+    build: ./oracle-backend
+    environment:
+      REDIS_URL: redis://redis:6379
+      POSTGRES_URL: postgres://oracle:oracle@postgres/oracle
+      RPC_URL: https://api.mainnet-beta.solana.com
+    depends_on:
+      - redis
+      - postgres
+    ports:
+      - "8080:8080"
+
+----------------
