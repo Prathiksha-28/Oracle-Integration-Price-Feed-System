@@ -1,0 +1,126 @@
+# AnchorProgram/Cargo.toml
+[package]
+```
+name = "oracle_program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anchor-lang = "0.29.0"
+pyth-sdk-solana = "0.7.0"
+switchboard-solana = "0.3.3"
+
+# AnchorProgram/programs/oracle_program/src/lib.rs
+```
+use anchor_lang::prelude::*;
+use pyth_sdk_solana::state::PriceAccount;
+
+declare_id!("9oraClE1111111111111111111111111111111111");
+
+## [program]
+pub mod oracle_program {
+    use super::*;
+
+    pub fn get_pyth_price(ctx: Context<GetPythPrice>) -> Result<PriceData> {
+        let feed_data = &ctx.accounts.price_feed;
+        let price_account = PriceAccount::account_info_to_price_feed(&feed_data)?;
+        let price_data = price_account.get_current_price().ok_or(ErrorCode::NoPrice)?;
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now - price_data.timestamp < ctx.accounts.config.max_staleness,
+            ErrorCode::Stale
+        );
+
+        require!(
+            price_data.conf <= ctx.accounts.config.max_confidence,
+            ErrorCode::BadConfidence
+        );
+
+        Ok(PriceData {
+            price: price_data.price,
+            confidence: price_data.conf,
+            expo: price_data.expo,
+            timestamp: price_data.timestamp,
+            source: PriceSource::Pyth,
+        })
+    }
+
+    pub fn get_switchboard_price(ctx: Context<GetSwitchboardPrice>) -> Result<PriceData> {
+        let aggregator = &ctx.accounts.aggregator.load()?;
+        let result = aggregator.get_result().ok_or(ErrorCode::NoPrice)?;
+
+        let now = Clock::get()?.unix_timestamp;
+
+        require!(
+            now - result.timestamp < ctx.accounts.config.max_staleness,
+            ErrorCode::Stale
+        );
+
+        Ok(PriceData {
+            price: result.value,
+            confidence: result.confidence,
+            expo: result.exponent,
+            timestamp: result.timestamp,
+            source: PriceSource::Switchboard,
+        })
+    }
+
+    pub fn validate_price_consensus(
+        _ctx: Context<ValidatePrice>,
+        mut prices: Vec<PriceData>,
+    ) -> Result<u64> {
+        require!(prices.len() >= 1, ErrorCode::NotEnoughSources);
+
+        prices.sort_by(|a, b| a.price.cmp(&b.price));
+        let median = prices[prices.len() / 2].price;
+
+        for p in &prices {
+            let deviation = (((p.price - median).abs() as u64 * 10_000) / median as u64)
+                as u64;
+            require!(deviation <= 100, ErrorCode::DeviationTooHigh); // 1%
+        }
+
+        Ok(median as u64)
+    }
+}
+
+## [derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PriceData {
+    pub price: i64,
+    pub confidence: u64,
+    pub expo: i32,
+    pub timestamp: i64,
+    pub source: PriceSource,
+}
+
+## [derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq)]
+pub enum PriceSource {
+    Pyth,
+    Switchboard,
+    Internal,
+}
+
+## [account]
+pub struct OracleConfig {
+    pub symbol: String,
+    pub pyth_feed: Pubkey,
+    pub switchboard_aggregator: Pubkey,
+    pub max_staleness: i64,
+    pub max_confidence: u64,
+    pub max_deviation: u64,
+}
+
+## [error_code]
+pub enum ErrorCode {
+    #[msg("No valid price available.")]
+    NoPrice,
+    #[msg("Price feed stale.")]
+    Stale,
+    #[msg("Confidence too high.")]
+    BadConfidence,
+    #[msg("Deviation too high.")]
+    DeviationTooHigh,
+    #[msg("Not enough price sources.")]
+    NotEnoughSources,
+}
