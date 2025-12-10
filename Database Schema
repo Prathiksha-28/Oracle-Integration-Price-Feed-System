@@ -1,7 +1,7 @@
 DATABASE SCHEMA (PostgreSQL)
 # 1️⃣ Table: symbols
 
-Used to register all tracked trading pairs.
+Used to register all tracked trading pairs
 
 CREATE TABLE symbols (
     id SERIAL PRIMARY KEY,
