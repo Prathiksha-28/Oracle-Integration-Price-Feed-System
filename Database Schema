@@ -1,0 +1,128 @@
+DATABASE SCHEMA (PostgreSQL)
+# 1️⃣ Table: symbols
+
+Used to register all tracked trading pairs.
+
+CREATE TABLE symbols (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT UNIQUE NOT NULL,
+    pyth_feed TEXT,
+    switchboard_feed TEXT,
+    max_staleness INT DEFAULT 30,
+    max_confidence INT DEFAULT 100,    -- basis points
+    max_deviation INT DEFAULT 100      -- basis points (1%)
+);
+
+# 2️⃣ Table: price_history
+
+Stores consensus price, one row per update.
+
+This table grows fast — you can optionally partition by day or month.
+
+CREATE TABLE price_history (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    ts BIGINT NOT NULL,
+    inserted_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_price_history_symbol_ts
+    ON price_history (symbol, ts DESC);
+
+# 3️⃣ Table: source_prices
+
+Stores raw oracle source inputs (Pyth, Switchboard, Internal).
+
+CREATE TABLE source_prices (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    source TEXT NOT NULL,                     -- 'pyth', 'switchboard', 'internal'
+    price DOUBLE PRECISION NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    ts BIGINT NOT NULL,
+    received_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_source_prices_symbol_ts
+    ON source_prices (symbol, ts DESC);
+
+# 4️⃣ Table: oracle_health
+
+Stores latest health information for each oracle source:
+
+CREATE TABLE oracle_health (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    source TEXT NOT NULL,
+    last_update_ts BIGINT NOT NULL,
+    staleness_seconds INT,
+    confidence DOUBLE PRECISION,
+    status TEXT NOT NULL,                     -- 'healthy', 'degraded', 'offline'
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(symbol, source)
+);
+
+# 5️⃣ Table: deviation_alerts
+
+Triggers when Pyth vs Switchboard deviation > threshold.
+
+CREATE TABLE deviation_alerts (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    pyth_price DOUBLE PRECISION,
+    switchboard_price DOUBLE PRECISION,
+    deviation_bps INT NOT NULL,
+    ts BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_deviation_alerts_symbol_ts
+    ON deviation_alerts (symbol, ts DESC);
+
+# 6️⃣ Table: manipulation_events
+
+Stores suspicious oracle conditions: flash crashes, timestamp drift, confidence spikes, etc.
+
+CREATE TABLE manipulation_events (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    details JSONB,
+    severity TEXT NOT NULL,      -- 'low', 'medium', 'high', 'critical'
+    detected_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_manipulation_events_symbol
+    ON manipulation_events (symbol);
+
+# 7️⃣ Table: source_reliability
+
+Tracks long-term reliability for dashboards and monitoring.
+
+CREATE TABLE source_reliability (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    source TEXT NOT NULL,
+    uptime_percent DOUBLE PRECISION,
+    avg_staleness DOUBLE PRECISION,
+    avg_confidence DOUBLE PRECISION,
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+# 8️⃣ Table: aggregator_log
+
+Stores details about each consensus calculation (debug + audits).
+
+CREATE TABLE aggregator_log (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    median_price DOUBLE PRECISION NOT NULL,
+    num_sources INT NOT NULL,
+    used_sources JSONB NOT NULL,            -- e.g. [{source:'pyth', price:...}, ...]
+    rejected_sources JSONB,
+    deviation_check BOOLEAN NOT NULL,
+    ts BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
