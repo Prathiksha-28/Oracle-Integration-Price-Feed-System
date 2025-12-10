@@ -1,0 +1,30 @@
+API (REST + WebSocket)
+
+# oracle-backend/src/api/rest.rs
+use axum::{
+    routing::get,
+    Router,
+    response::Json,
+};
+use crate::storage::redis::RedisStore;
+use crate::config::Config;
+
+pub async fn start_rest_api(config: Config) {
+    let redis = RedisStore::new(&config.redis_url).await;
+
+    let app = Router::new()
+        .route("/oracle/price/:symbol", get(move |p| get_price(p, redis.clone())));
+
+    axum::Server::bind(&"0.0.0.0:8080".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+async fn get_price(
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+    redis: RedisStore,
+) -> Json<serde_json::Value> {
+    let p = redis.get_price(&symbol).await;
+    Json(serde_json::json!({ "symbol": symbol, "data": p }))
+}
